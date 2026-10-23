@@ -9,6 +9,17 @@ DISABLE_PASSWORD="no"
 SSHD_CONFIG="/etc/ssh/sshd_config"
 SOCKET_DROPIN="/etc/systemd/system/ssh.socket.d/port.conf"
 D_BACKUPS=()
+D_DONE=""
+
+# 备份 sshd_config.d 里的文件（每个文件只备份一次，保证回滚能恢复原始内容）
+backup_d_file() {
+    local f="$1"
+    case " $D_DONE " in *" $f "*) return ;; esac
+    local bak="${f}.bak.$(date +%s)"
+    cp "$f" "$bak"
+    D_BACKUPS+=("$bak")
+    D_DONE="$D_DONE $f"
+}
 
 usage() {
     echo "用法: $0 -g <GitHub用户名> [-p 端口] [-d]"
@@ -114,6 +125,19 @@ else
     echo "Port $SSH_PORT" >> "$SSHD_CONFIG"
 fi
 
+# sshd 的 Port 可以叠加：sshd_config.d 里如果还有别的 Port，会同时监听多个端口
+# 这里把它们注释掉，保证只监听你指定的端口
+if [ -d /etc/ssh/sshd_config.d ]; then
+    for f in /etc/ssh/sshd_config.d/*.conf; do
+        [ -e "$f" ] || continue
+        if grep -qE '^\s*Port\s+[0-9]+' "$f"; then
+            backup_d_file "$f"
+            sed -i -E 's/^(\s*Port\s+[0-9]+.*)$/# \1  # disabled by key.sh/' "$f"
+            echo "已注释 $f 中冲突的 Port 配置"
+        fi
+    done
+fi
+
 # ---------- 4. 禁用密码登录 ----------
 if [ "$DISABLE_PASSWORD" = "yes" ]; then
     echo "正在禁用密码登录，强制开启密钥登录..."
@@ -135,9 +159,7 @@ if [ "$DISABLE_PASSWORD" = "yes" ]; then
         for f in /etc/ssh/sshd_config.d/*.conf; do
             [ -e "$f" ] || continue
             if grep -qiE '^\s*(PasswordAuthentication|KbdInteractiveAuthentication)\s+yes' "$f"; then
-                bak="${f}.bak.$(date +%s)"
-                cp "$f" "$bak"
-                D_BACKUPS+=("$bak")
+                backup_d_file "$f"
                 sed -i -E 's/^\s*(PasswordAuthentication|KbdInteractiveAuthentication)\s+yes/\1 no/I' "$f"
             fi
         done
@@ -174,18 +196,7 @@ if [ "$SSH_PORT" != "22" ] && command -v getenforce >/dev/null 2>&1 \
     fi
 fi
 
-# ---------- 7. 防火墙：自动放行新端口 ----------
-if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-    ufw allow "${SSH_PORT}/tcp" >/dev/null && echo "✅ ufw 已放行 ${SSH_PORT}/tcp"
-fi
-if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-    firewall-cmd --permanent --add-port="${SSH_PORT}/tcp" >/dev/null \
-        && firewall-cmd --reload >/dev/null \
-        && echo "✅ firewalld 已放行 ${SSH_PORT}/tcp"
-fi
-echo "⚠️  如果是云服务器，还需要在控制台「安全组」放行 TCP ${SSH_PORT}"
-
-# ---------- 8. 重启服务（兼容 Ubuntu 22.10+ 的 ssh.socket） ----------
+# ---------- 7. 重启服务（兼容 Ubuntu 22.10+ 的 ssh.socket） ----------
 echo "正在重启 SSH 服务..."
 if systemctl is-active --quiet ssh.socket 2>/dev/null; then
     mkdir -p "$(dirname "$SOCKET_DROPIN")"
@@ -201,7 +212,7 @@ fi
 restart_ssh
 sleep 2
 
-# ---------- 9. 验证端口确实在监听，否则回滚 ----------
+# ---------- 8. 验证端口确实在监听，否则回滚 ----------
 if ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${SSH_PORT}$"; then
     echo "✅ SSH 服务已在端口 $SSH_PORT 上监听"
 else
@@ -210,6 +221,17 @@ else
     rollback
     exit 1
 fi
+
+# ---------- 9. 防火墙：确认 SSH 正常后才放行新端口 ----------
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw allow "${SSH_PORT}/tcp" >/dev/null && echo "✅ ufw 已放行 ${SSH_PORT}/tcp"
+fi
+if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd --permanent --add-port="${SSH_PORT}/tcp" >/dev/null \
+        && firewall-cmd --reload >/dev/null \
+        && echo "✅ firewalld 已放行 ${SSH_PORT}/tcp"
+fi
+echo "⚠️  如果是云服务器，还需要在控制台「安全组」放行 TCP ${SSH_PORT}"
 
 # ---------- 10. 显示实际生效的配置 ----------
 echo "---------- 实际生效的配置 ----------"
