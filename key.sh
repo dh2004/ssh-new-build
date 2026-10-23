@@ -1,11 +1,14 @@
 #!/bin/bash
 # 用法: bash key.sh -g <GitHub用户名> [-p 端口] [-d]
+# 支持: Debian / Ubuntu / Fedora / RHEL / Rocky / AlmaLinux / CentOS
 set -u
 
 GH_USER=""
 SSH_PORT="22"
 DISABLE_PASSWORD="no"
 SSHD_CONFIG="/etc/ssh/sshd_config"
+SOCKET_DROPIN="/etc/systemd/system/ssh.socket.d/port.conf"
+D_BACKUPS=()
 
 usage() {
     echo "用法: $0 -g <GitHub用户名> [-p 端口] [-d]"
@@ -24,7 +27,7 @@ while getopts "o:g:p:d" opt; do
     esac
 done
 
-# 0. 基础检查
+# ---------- 0. 基础检查 ----------
 if [ "$(id -u)" -ne 0 ]; then
     echo "❌ 请使用 root 权限运行（sudo）"
     exit 1
@@ -40,15 +43,38 @@ if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || [ "$SSH_PORT" -lt 1 ] || [ "$SSH_PORT" -gt
     exit 1
 fi
 
-if ! command -v sshd >/dev/null 2>&1 && [ ! -x /usr/sbin/sshd ]; then
+SSHD_BIN=$(command -v sshd || echo /usr/sbin/sshd)
+if [ ! -x "$SSHD_BIN" ]; then
     echo "❌ 未找到 sshd，请先安装 openssh-server"
     exit 1
 fi
-SSHD_BIN=$(command -v sshd || echo /usr/sbin/sshd)
+
+restart_ssh() {
+    systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
+}
+
+# 回滚：恢复所有配置并重启 sshd
+rollback() {
+    echo "↩️  正在回滚配置..."
+    cp "$BACKUP" "$SSHD_CONFIG"
+    for bak in ${D_BACKUPS[@]+"${D_BACKUPS[@]}"}; do
+        cp "$bak" "${bak%.bak.*}"
+    done
+    if [ -f "$SOCKET_DROPIN" ]; then
+        rm -f "$SOCKET_DROPIN"
+        systemctl daemon-reload
+        systemctl restart ssh.socket 2>/dev/null || true
+    fi
+    if restart_ssh; then
+        echo "✅ 已恢复原配置，SSH 服务正常运行"
+    else
+        echo "⚠️ 回滚后服务重启失败，请手动检查: systemctl status sshd"
+    fi
+}
 
 echo "========== 开始安全配置 SSH =========="
 
-# 1. 下载并校验公钥
+# ---------- 1. 下载并校验公钥 ----------
 echo "正在从 GitHub 获取用户 [ $GH_USER ] 的公钥..."
 TMP_KEYS=$(mktemp)
 trap 'rm -f "$TMP_KEYS" "${TMP_KEYS}.valid"' EXIT
@@ -58,7 +84,6 @@ if ! curl -fsSL --max-time 15 "https://github.com/${GH_USER}.keys" -o "$TMP_KEYS
     exit 1
 fi
 
-# 只保留合法的公钥行
 grep -E '^(ssh-(rsa|ed25519)|ecdsa-sha2-|sk-)' "$TMP_KEYS" > "${TMP_KEYS}.valid" || true
 mv "${TMP_KEYS}.valid" "$TMP_KEYS"
 
@@ -70,19 +95,18 @@ fi
 mkdir -p ~/.ssh && chmod 700 ~/.ssh
 touch ~/.ssh/authorized_keys
 
-# 去重追加
 while IFS= read -r key; do
     grep -qxF "$key" ~/.ssh/authorized_keys || echo "$key" >> ~/.ssh/authorized_keys
 done < "$TMP_KEYS"
 chmod 600 ~/.ssh/authorized_keys
 echo "✅ 成功导入 GitHub 公钥（共 $(wc -l < "$TMP_KEYS") 个）"
 
-# 2. 备份配置
+# ---------- 2. 备份配置 ----------
 BACKUP="${SSHD_CONFIG}.bak.$(date +%F-%H%M%S)"
 cp "$SSHD_CONFIG" "$BACKUP"
 echo "已备份配置到 $BACKUP"
 
-# 3. 修改端口
+# ---------- 3. 修改端口 ----------
 echo "正在将 SSH 端口修改为: $SSH_PORT"
 if grep -qE "^#?Port " "$SSHD_CONFIG"; then
     sed -i -E "s/^#?Port .*/Port $SSH_PORT/" "$SSHD_CONFIG"
@@ -90,7 +114,7 @@ else
     echo "Port $SSH_PORT" >> "$SSHD_CONFIG"
 fi
 
-# 4. 禁用密码登录
+# ---------- 4. 禁用密码登录 ----------
 if [ "$DISABLE_PASSWORD" = "yes" ]; then
     echo "正在禁用密码登录，强制开启密钥登录..."
     for opt_name in PasswordAuthentication KbdInteractiveAuthentication; do
@@ -110,20 +134,47 @@ if [ "$DISABLE_PASSWORD" = "yes" ]; then
     if [ -d /etc/ssh/sshd_config.d ]; then
         for f in /etc/ssh/sshd_config.d/*.conf; do
             [ -e "$f" ] || continue
-            cp "$f" "${f}.bak.$(date +%s)" 2>/dev/null || true
-            sed -i -E 's/^\s*(PasswordAuthentication|KbdInteractiveAuthentication)\s+yes/\1 no/I' "$f"
+            if grep -qiE '^\s*(PasswordAuthentication|KbdInteractiveAuthentication)\s+yes' "$f"; then
+                bak="${f}.bak.$(date +%s)"
+                cp "$f" "$bak"
+                D_BACKUPS+=("$bak")
+                sed -i -E 's/^\s*(PasswordAuthentication|KbdInteractiveAuthentication)\s+yes/\1 no/I' "$f"
+            fi
         done
     fi
 fi
 
-# 5. 语法检查，失败则回滚
+# ---------- 5. 语法检查 ----------
 if ! "$SSHD_BIN" -t; then
-    echo "❌ sshd 配置语法错误，已回滚"
-    cp "$BACKUP" "$SSHD_CONFIG"
+    echo "❌ sshd 配置语法错误"
+    rollback
     exit 1
 fi
 
-# 6. 防火墙：自动放行新端口（仅在防火墙已启用时）
+# ---------- 6. SELinux：允许 sshd 监听自定义端口 ----------
+if [ "$SSH_PORT" != "22" ] && command -v getenforce >/dev/null 2>&1 \
+   && [ "$(getenforce)" != "Disabled" ]; then
+    echo "检测到 SELinux，正在放行端口 $SSH_PORT ..."
+    if ! command -v semanage >/dev/null 2>&1; then
+        (dnf install -y policycoreutils-python-utils || yum install -y policycoreutils-python-utils) >/dev/null 2>&1
+    fi
+    if command -v semanage >/dev/null 2>&1; then
+        if semanage port -a -t ssh_port_t -p tcp "$SSH_PORT" 2>/dev/null \
+           || semanage port -m -t ssh_port_t -p tcp "$SSH_PORT" 2>/dev/null; then
+            echo "✅ SELinux 已允许 sshd 使用端口 $SSH_PORT"
+        else
+            echo "❌ SELinux 端口放行失败"
+            rollback
+            exit 1
+        fi
+    else
+        echo "❌ 无法安装 semanage（policycoreutils-python-utils），无法放行 SELinux 端口"
+        rollback
+        exit 1
+    fi
+fi
+
+# ---------- 7. 防火墙：自动放行新端口 ----------
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
     ufw allow "${SSH_PORT}/tcp" >/dev/null && echo "✅ ufw 已放行 ${SSH_PORT}/tcp"
 fi
@@ -134,11 +185,11 @@ if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>
 fi
 echo "⚠️  如果是云服务器，还需要在控制台「安全组」放行 TCP ${SSH_PORT}"
 
-# 7. 重启服务（兼容 Ubuntu 22.10+ 的 ssh.socket）
+# ---------- 8. 重启服务（兼容 Ubuntu 22.10+ 的 ssh.socket） ----------
 echo "正在重启 SSH 服务..."
 if systemctl is-active --quiet ssh.socket 2>/dev/null; then
-    mkdir -p /etc/systemd/system/ssh.socket.d
-    cat > /etc/systemd/system/ssh.socket.d/port.conf <<EOF
+    mkdir -p "$(dirname "$SOCKET_DROPIN")"
+    cat > "$SOCKET_DROPIN" <<EOF
 [Socket]
 ListenStream=
 ListenStream=${SSH_PORT}
@@ -147,17 +198,24 @@ EOF
     systemctl restart ssh.socket
 fi
 
-if systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null; then
-    echo "✅ SSH 服务重启成功！"
+restart_ssh
+sleep 2
+
+# ---------- 9. 验证端口确实在监听，否则回滚 ----------
+if ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${SSH_PORT}$"; then
+    echo "✅ SSH 服务已在端口 $SSH_PORT 上监听"
 else
-    echo "⚠️ 自动重启失败，请手动运行: systemctl restart sshd（或 ssh）"
+    echo "❌ 端口 $SSH_PORT 没有在监听，新配置未生效"
+    systemctl status sshd --no-pager -l 2>/dev/null | tail -8
+    rollback
+    exit 1
 fi
 
-# 8. 显示实际生效的配置
+# ---------- 10. 显示实际生效的配置 ----------
 echo "---------- 实际生效的配置 ----------"
 "$SSHD_BIN" -T 2>/dev/null | grep -E '^(port|passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication) ' || true
-echo "---------- 当前监听端口 ----------"
-ss -tlnp 2>/dev/null | grep -E 'sshd|:'"${SSH_PORT}"'\b' || true
+echo "---------- 当前监听 ----------"
+ss -tlnp 2>/dev/null | grep -E ":${SSH_PORT}\b" || true
 
 echo "========== 配置完成！=========="
 echo "👉 新端口: $SSH_PORT"
